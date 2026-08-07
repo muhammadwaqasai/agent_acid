@@ -1,0 +1,124 @@
+# agent_acid
+
+**ACID-style transaction guarantees for autonomous AI agents.**
+
+AI agents that take real-world actions (charging cards, writing to databases, sending emails, calling APIs) have no standard way to "undo" a partially-completed task, and most guardrail systems only validate one action at a time — with no memory of the session. `agent_acid` closes both gaps:
+
+1. **Automatic rollback** — if any step in a multi-step agent plan fails, every completed step before it is automatically undone, in reverse order.
+2. **Guardrails** — hard, code-level rules (not prompts) that block bad AI outputs even when nothing "crashes."
+3. **Stateful (session-wide) guardrails** — catch multi-step manipulation, like an attacker or a manipulated AI splitting one large forbidden action into several small, individually-legal ones ("salami slicing").
+
+This isn't a theoretical framework — every claim below is backed by a runnable test or live demo in this repo.
+
+---
+
+## Why this exists
+
+Salami-slicing–style attacks against AI agents are an actively studied problem: guardrails that only judge one tool call at a time are "memoryless," letting an attacker spread a forbidden action across many small steps where no single step trips the alarm. `agent_acid`'s stateful guardrails are built specifically to close this gap.
+
+---
+
+## Quick start
+
+```bash
+pip install -r requirements.txt   # or just: pip install openai pytest
+```
+
+Run the automated test suite (no API key needed, proves the core engine works):
+```bash
+pytest tests/test_core.py -v
+```
+
+Run the basic rollback demo (no API key needed):
+```bash
+python examples/basic_rollback.py
+```
+
+Run the guardrail demo (no API key needed):
+```bash
+python examples/guardrail_demo.py
+```
+
+Run the real AI-agent demos (requires an OpenAI API key):
+```bash
+export OPENAI_API_KEY="sk-..."          # Mac/Linux
+$env:OPENAI_API_KEY = "sk-..."          # Windows PowerShell
+
+python examples/llm_agent_demo.py
+python examples/attack_test_prompt_injection.py
+python examples/attack_test_salami_slicing.py
+python examples/comparison_naive_agent.py
+```
+
+---
+
+## The core idea
+
+```python
+from agent_acid.core import ReversibleTool, TransactionContext, AgentTransactionEngine
+from agent_acid.guardrails import max_value, cumulative_max
+
+charge_tool = ReversibleTool(
+    name="charge_card",
+    description="Charges a customer's card",
+    execute=lambda kwargs: real_payment_api.charge(kwargs),
+    compensate=lambda kwargs, result: real_payment_api.refund(result["charge_id"]),
+    guardrails=[max_value("amount", limit=500)],
+    stateful_guardrails=[cumulative_max("charge_card", "amount", session_limit=1000)],
+)
+
+engine = AgentTransactionEngine()
+ctx = TransactionContext()
+engine.execute_plan(ctx, [
+    (charge_tool, {"user_id": "u1", "amount": 400}),
+    (charge_tool, {"user_id": "u1", "amount": 400}),
+    (charge_tool, {"user_id": "u1", "amount": 400}),  # total now 1200 -> blocked & fully refunded
+])
+```
+
+---
+
+## Proven results
+
+### Attack 1: Prompt injection (hidden instruction overriding a spending limit)
+A "customer ticket" contains a fake administrator note trying to convince the AI to charge $75,000 instead of following the $500 limit. The AI gets fooled and attempts the charge — `agent_acid`'s guardrail blocks it and fully reverses the account creation and the charge.
+
+### Attack 2: Salami slicing (splitting one large charge into several small ones)
+The AI is instructed to charge $1,200 as three separate $400 charges specifically to stay under a $500 per-step limit. Each individual charge passes the per-step check. `agent_acid`'s cumulative guardrail tracks the running total across the whole session and blocks the third charge once the total crosses $1,000 — then rolls back all three charges and the account.
+
+### Head-to-head comparison
+The same salami-slicing attack was run against a naive agent using only a per-step check (representative of how most simple guardrail integrations work):
+
+| | Naive agent | agent_acid |
+|---|---|---|
+| Per-step limit ($500) | Enforced | Enforced |
+| 3× $400 charge attack | **All 3 succeeded — $1,200 charged** | Blocked on 3rd call |
+| Rollback available? | **No — money is gone** | Yes — fully refunded |
+| Account left behind? | **Yes, permanently** | Deleted during rollback |
+
+See `examples/comparison_naive_agent.py` and `examples/attack_test_salami_slicing.py` to reproduce this yourself.
+
+---
+
+## Project structure
+
+```
+agent_acid/
+├── agent_acid/
+│   ├── core.py          # TransactionContext, ReversibleTool, AgentTransactionEngine
+│   ├── guardrails.py     # Guardrail + StatefulGuardrail (session-memory) rules
+│   └── llm_agent.py      # Connects OpenAI function-calling to the engine
+├── examples/
+│   ├── basic_rollback.py
+│   ├── guardrail_demo.py
+│   ├── llm_agent_demo.py
+│   ├── attack_test_prompt_injection.py
+│   ├── attack_test_salami_slicing.py
+│   └── comparison_naive_agent.py
+└── tests/
+    └── test_core.py       # Automated proof of every core guarantee
+```
+
+## Status
+
+Early-stage, actively developed. Core engine and guardrail layer are tested and working. Contributions and adversarial testing (try to break it!) are welcome.
