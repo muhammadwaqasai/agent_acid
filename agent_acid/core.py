@@ -3,11 +3,13 @@ agent_acid.core
 ================
 The heart of the "Undo Engine" for AI Agents.
 
-Three building blocks:
-1. ReversibleTool   - a tool that knows how to execute AND undo itself
-2. TransactionContext - keeps a history/log of everything that happened
-3. AgentTransactionEngine - runs a plan step by step; if anything fails,
-   it automatically undoes everything in reverse order (LIFO)
+Building blocks:
+1. ReversibleTool   - a tool that knows how to execute AND undo itself,
+                       with an optional risk tier (GREEN/YELLOW/RED)
+2. TransactionContext - keeps a history/log of everything that happened,
+                       plus any action currently paused for approval
+3. AgentTransactionEngine - runs steps; handles rollback, guardrails,
+                       and now risk-tiered permission checks
 """
 
 import uuid
@@ -17,8 +19,8 @@ from enum import Enum
 from typing import Callable, Any, Dict, List, Tuple, Optional
 
 from agent_acid.guardrails import Guardrail, run_guardrails, GuardrailViolation, StatefulGuardrail, run_stateful_guardrails
+from agent_acid.permissions import RiskLevel, check_permission, ApprovalRequired, VerificationFailed, PendingAction
 
-# --- Logging setup (so you get clean, readable output) ---
 logger = logging.getLogger("agent_acid")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -28,6 +30,7 @@ class TransactionStatus(Enum):
     COMMITTED = "committed"
     ROLLED_BACK = "rolled_back"
     FAILED = "failed"
+    PENDING_APPROVAL = "pending_approval"
 
 
 @dataclass
@@ -35,11 +38,10 @@ class ReversibleTool:
     """
     A wrapper around any action that also knows how to undo itself.
 
-    name        : human readable identifier
-    description : what the tool does (useful later for LLM function-calling)
-    execute     : function that performs the real action, returns a result
-    compensate  : function that undoes the action, given the original input
-                  and the result that execute() produced
+    risk_level : GREEN (default, auto-execute), YELLOW (needs verify_fn
+                 to pass), or RED (needs explicit human approval)
+    verify_fn  : for YELLOW tools -- (kwargs) -> (ok: bool, reason: str)
+    risk_reason: for RED tools -- shown to whoever approves/rejects
     """
     name: str
     description: str
@@ -47,6 +49,9 @@ class ReversibleTool:
     compensate: Callable[[Dict[str, Any], Any], None]
     guardrails: List[Guardrail] = field(default_factory=list)
     stateful_guardrails: List[StatefulGuardrail] = field(default_factory=list)
+    risk_level: RiskLevel = RiskLevel.GREEN
+    verify_fn: Optional[Callable[[Dict[str, Any]], Tuple[bool, str]]] = None
+    risk_reason: str = ""
 
 
 @dataclass
@@ -62,6 +67,7 @@ class TransactionContext:
     transaction_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
     history: List[StepRecord] = field(default_factory=list)
     status: TransactionStatus = TransactionStatus.PENDING
+    pending_action: Optional[PendingAction] = None
 
     def log_step(self, tool: ReversibleTool, kwargs: dict, result: Any):
         self.history.append(StepRecord(tool=tool, kwargs=kwargs, result=result))
@@ -69,11 +75,8 @@ class TransactionContext:
 
 class AgentTransactionEngine:
     """
-    The supervisor. Give it a list of (tool, kwargs) steps.
-    It executes them in order. If any step raises an exception,
-    it automatically calls .compensate() on every already-completed
-    step, in reverse order, so the system ends up exactly as it
-    started.
+    The supervisor. Executes steps, checks guardrails, checks risk-tier
+    permissions, and rolls back everything on failure.
     """
 
     def execute_plan(
@@ -84,19 +87,31 @@ class AgentTransactionEngine:
         logger.info(f"\n=== Starting transaction {ctx.transaction_id} ===")
 
         for tool, kwargs in steps:
+            # Permission check happens BEFORE anything touches the real world
+            try:
+                pending = check_permission(tool, kwargs)
+            except VerificationFailed as e:
+                logger.info(f"[VERIFICATION FAILED] {tool.name}: {e}")
+                self._rollback(ctx)
+                ctx.status = TransactionStatus.FAILED
+                logger.info(f"=== Transaction {ctx.transaction_id} FAILED VERIFICATION & ROLLED BACK ===\n")
+                return False
+
+            if pending is not None:
+                logger.info(f"[PAUSED FOR APPROVAL] {tool.name}: {pending.reason}")
+                ctx.pending_action = pending
+                ctx.status = TransactionStatus.PENDING_APPROVAL
+                logger.info(f"=== Transaction {ctx.transaction_id} PAUSED — awaiting human approval ===\n")
+                return False  # caller should check ctx.status / ctx.pending_action
+
             logger.info(f"[EXECUTING] {tool.name} with {kwargs}")
             try:
                 result = tool.execute(kwargs)
-
-                # Guardrail check happens BEFORE we consider this step "safe".
-                # If it fails here, the action already happened in the real
-                # world, so we log it first so rollback knows to undo it too.
                 ctx.log_step(tool, kwargs, result)
                 if tool.guardrails:
                     run_guardrails(tool.guardrails, kwargs, result)
                 if tool.stateful_guardrails:
                     run_stateful_guardrails(tool.stateful_guardrails, ctx, kwargs, result)
-
                 logger.info(f"   -> OK: {result}")
             except GuardrailViolation as e:
                 logger.info(f"[GUARDRAIL BLOCKED] {tool.name}: {e}")
@@ -117,18 +132,44 @@ class AgentTransactionEngine:
         logger.info(f"=== Transaction {ctx.transaction_id} COMMITTED successfully ===\n")
         return True
 
-    def execute_step(
-        self,
-        ctx: TransactionContext,
-        tool: ReversibleTool,
-        kwargs: Dict[str, Any],
-    ) -> Any:
-        """
-        Execute ONE step live (used when a real AI agent is deciding steps
-        one at a time, rather than a pre-made plan). Raises on failure —
-        the caller (e.g. the LLM agent loop) decides whether to call
-        abort() to roll everything back, or keep going.
-        """
+    def approve_pending(self, ctx: TransactionContext) -> Any:
+        """A human approved the held RED action. Execute it for real now."""
+        if ctx.pending_action is None:
+            raise ValueError("No pending action to approve on this context.")
+
+        pending = ctx.pending_action
+        logger.info(f"[APPROVED BY HUMAN] Executing previously-held action: {pending.tool.name}")
+        ctx.pending_action = None
+        ctx.status = TransactionStatus.PENDING
+
+        logger.info(f"[EXECUTING] {pending.tool.name} with {pending.kwargs}")
+        result = pending.tool.execute(pending.kwargs)
+        ctx.log_step(pending.tool, pending.kwargs, result)
+        if pending.tool.guardrails:
+            run_guardrails(pending.tool.guardrails, pending.kwargs, result)
+        if pending.tool.stateful_guardrails:
+            run_stateful_guardrails(pending.tool.stateful_guardrails, ctx, pending.kwargs, result)
+        logger.info(f"   -> OK: {result}")
+        return result
+
+    def reject_pending(self, ctx: TransactionContext, reason: str = ""):
+        """A human rejected the pending action. It was NEVER executed,
+        so there's nothing to roll back -- just clear the pending state."""
+        if ctx.pending_action is None:
+            raise ValueError("No pending action to reject on this context.")
+
+        logger.info(f"[REJECTED BY HUMAN] {ctx.pending_action.tool.name} will NOT be executed. "
+                    f"Reason: {reason or 'not specified'}")
+        ctx.pending_action = None
+        ctx.status = TransactionStatus.FAILED
+
+    def execute_step(self, ctx: TransactionContext, tool: ReversibleTool, kwargs: Dict[str, Any]) -> Any:
+        pending = check_permission(tool, kwargs)
+        if pending is not None:
+            ctx.pending_action = pending
+            ctx.status = TransactionStatus.PENDING_APPROVAL
+            raise ApprovalRequired(pending)
+
         logger.info(f"[EXECUTING] {tool.name} with {kwargs}")
         result = tool.execute(kwargs)
         ctx.log_step(tool, kwargs, result)
@@ -140,19 +181,16 @@ class AgentTransactionEngine:
         return result
 
     def commit(self, ctx: TransactionContext):
-        """Mark a live transaction as successfully finished. Nothing to undo."""
         ctx.status = TransactionStatus.COMMITTED
         logger.info(f"=== Transaction {ctx.transaction_id} COMMITTED successfully ===\n")
 
     def abort(self, ctx: TransactionContext):
-        """Publicly callable rollback — undoes everything done so far in a live transaction."""
         logger.info("[ROLLBACK TRIGGERED] Undoing completed steps...")
         self._rollback(ctx)
         ctx.status = TransactionStatus.FAILED
         logger.info(f"=== Transaction {ctx.transaction_id} ABORTED & ROLLED BACK ===\n")
 
     def _rollback(self, ctx: TransactionContext):
-        # Undo in reverse order: last action taken is undone first
         while ctx.history:
             step = ctx.history.pop()
             logger.info(f"[UNDO] {step.tool.name}")
@@ -160,6 +198,5 @@ class AgentTransactionEngine:
                 step.tool.compensate(step.kwargs, step.result)
                 logger.info(f"   -> undone OK")
             except Exception as rollback_err:
-                # This is the one truly dangerous case: undo itself failed.
                 logger.info(f"   -> CRITICAL: compensation failed: {rollback_err}")
         ctx.status = TransactionStatus.ROLLED_BACK
